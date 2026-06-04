@@ -3,6 +3,7 @@ import type {KeywordCxt} from "../../compile/validate"
 import {_, getProperty, Name} from "../../compile/codegen"
 import {DiscrError, DiscrErrorObj} from "../discriminator/types"
 import {resolveRef, SchemaEnv} from "../../compile"
+import MissingRefError from "../../compile/ref_error"
 import {schemaHasRulesButRef} from "../../compile/util"
 
 export type DiscriminatorError = DiscrErrorObj<DiscrError.Tag> | DiscrErrorObj<DiscrError.Mapping>
@@ -29,7 +30,6 @@ const def: CodeKeywordDefinition = {
     }
     const tagName = schema.propertyName
     if (typeof tagName != "string") throw new Error("discriminator: requires propertyName")
-    if (schema.mapping) throw new Error("discriminator: mapping is not supported")
     if (!oneOf) throw new Error("discriminator: requires oneOf keyword")
     const valid = gen.let("valid", false)
     const tag = gen.const("tag", _`${data}${getProperty(tagName)}`)
@@ -63,11 +63,41 @@ const def: CodeKeywordDefinition = {
       const oneOfMapping: {[T in string]?: number} = {}
       const topRequired = hasRequired(parentSchema)
       let tagRequired = true
+
+      if (schema.mapping) {
+        const refToIndex: {[ref: string]: number} = {}
+        for (let i = 0; i < oneOf.length; i++) {
+          const sch = oneOf[i]
+          if (sch?.$ref) refToIndex[sch.$ref] = i
+        }
+        for (const [tagValue, ref] of Object.entries(schema.mapping) as [string, string][]) {
+          const i = refToIndex[ref]
+          if (i === undefined) {
+            throw new Error(`discriminator: mapping "${tagValue}" does not correspond to any oneOf entry`)
+          }
+          addMapping(tagValue, i)
+        }
+        for (let i = 0; i < oneOf.length; i++) {
+          let sch = oneOf[i]
+          if (sch?.$ref && !schemaHasRulesButRef(sch, it.self.RULES)) {
+            const ref = sch.$ref
+            sch = resolveRef.call(it.self, it.schemaEnv.root, it.baseId, ref)
+            if (sch instanceof SchemaEnv) sch = sch.schema
+            if (sch === undefined) throw new MissingRefError(it.opts.uriResolver, it.baseId, ref)
+          }
+          tagRequired = tagRequired && (topRequired || hasRequired(sch))
+        }
+        if (!tagRequired) throw new Error(`discriminator: "${tagName}" must be required`)
+        return oneOfMapping
+      }
+
       for (let i = 0; i < oneOf.length; i++) {
         let sch = oneOf[i]
         if (sch?.$ref && !schemaHasRulesButRef(sch, it.self.RULES)) {
-          sch = resolveRef.call(it.self, it.schemaEnv.root, it.baseId, sch?.$ref)
+          const ref = sch.$ref
+          sch = resolveRef.call(it.self, it.schemaEnv.root, it.baseId, ref)
           if (sch instanceof SchemaEnv) sch = sch.schema
+          if (sch === undefined) throw new MissingRefError(it.opts.uriResolver, it.baseId, ref)
         }
         const propSch = sch?.properties?.[tagName]
         if (typeof propSch != "object") {

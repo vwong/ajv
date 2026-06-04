@@ -159,6 +159,67 @@ describe("discriminator keyword", function () {
     })
   })
 
+  describe("schema with external $refs", () => {
+    const schemas = {
+      main: {
+        type: "object",
+        discriminator: {propertyName: "foo"},
+        required: ["foo"],
+        oneOf: [
+          {
+            $ref: "schema1",
+          },
+          {
+            $ref: "schema2",
+          },
+        ],
+      },
+      schema1: {
+        type: "object",
+        properties: {
+          foo: {const: "x"},
+        },
+      },
+      schema2: {
+        type: "object",
+        properties: {
+          foo: {enum: ["y", "z"]},
+        },
+      },
+    }
+
+    const data = {foo: "x"}
+    const badData = {foo: "w"}
+
+    it("compile should resolve each $ref to a schema that was added with addSchema", () => {
+      const opts = {
+        discriminator: true,
+      }
+      const ajv = new _Ajv(opts)
+      ajv.addSchema(schemas.main, "https://host/main")
+      ajv.addSchema(schemas.schema1, "https://host/schema1")
+      ajv.addSchema(schemas.schema2, "https://host/schema2")
+
+      const validate = ajv.compile({$ref: "https://host/main"})
+      assert.strictEqual(validate(data), true)
+      assert.strictEqual(validate(badData), false)
+    })
+    it("compileAsync should loadSchema each $ref", async () => {
+      const opts = {
+        discriminator: true,
+        loadSchema(url) {
+          if (!url.startsWith("https://host/")) return undefined
+          const name = url.substring("https://host/".length)
+          return schemas[name]
+        },
+      }
+      const ajv = new _Ajv(opts)
+      const validate = await ajv.compileAsync({$ref: "https://host/main"})
+      assert.strictEqual(validate(data), true)
+      assert.strictEqual(validate(badData), false)
+    })
+  })
+
   describe("validation with deeply referenced schemas", () => {
     const schema = [
       {
@@ -238,6 +299,153 @@ describe("discriminator keyword", function () {
           ],
         },
       })
+    })
+  })
+
+  describe("validation with mapping", () => {
+    // Property schemas have no const/enum — mapping alone drives tag-value→schema routing.
+    const definitions = {
+      Cat: {
+        type: "object",
+        properties: {
+          type: {type: "string"},
+          meow: {type: "string"},
+        },
+        required: ["type", "meow"],
+      },
+      Dog: {
+        type: "object",
+        properties: {
+          type: {type: "string"},
+          bark: {type: "string"},
+        },
+        required: ["type", "bark"],
+      },
+    }
+
+    // required at parent level
+    const schema1 = {
+      type: "object",
+      discriminator: {
+        propertyName: "type",
+        mapping: {
+          cat: "#/definitions/Cat",
+          dog: "#/definitions/Dog",
+        },
+      },
+      required: ["type"],
+      oneOf: [{$ref: "#/definitions/Cat"}, {$ref: "#/definitions/Dog"}],
+      definitions,
+    }
+
+    // required inside subschemas
+    const schema2 = {
+      type: "object",
+      discriminator: {
+        propertyName: "type",
+        mapping: {
+          cat: "#/definitions/Cat",
+          dog: "#/definitions/Dog",
+        },
+      },
+      oneOf: [{$ref: "#/definitions/Cat"}, {$ref: "#/definitions/Dog"}],
+      definitions,
+    }
+
+    const schemas = [schema1, schema2]
+
+    it("should validate data", () => {
+      assertValid(schemas, {type: "cat", meow: "mrrr"})
+      assertValid(schemas, {type: "dog", bark: "woof"})
+      assertInvalid(schemas, {})
+      assertInvalid(schemas, {type: 1})
+      assertInvalid(schemas, {type: "bird"}) // not in mapping
+      assertInvalid(schemas, {type: "cat", bark: "woof"}) // missing required meow
+      assertInvalid(schemas, {type: "dog", meow: "mrrr"}) // missing required bark
+    })
+  })
+
+  describe("validation with mapping — multiple tag values to same schema", () => {
+    const schema = {
+      type: "object",
+      discriminator: {
+        propertyName: "foo",
+        mapping: {
+          x: "#/definitions/schema1",
+          y: "#/definitions/schema2",
+          z: "#/definitions/schema2",
+        },
+      },
+      required: ["foo"],
+      oneOf: [{$ref: "#/definitions/schema1"}, {$ref: "#/definitions/schema2"}],
+      definitions: {
+        schema1: {
+          type: "object",
+          properties: {foo: {type: "string"}, a: {type: "string"}},
+          required: ["a"],
+        },
+        schema2: {
+          type: "object",
+          properties: {foo: {type: "string"}, b: {type: "string"}},
+          required: ["b"],
+        },
+      },
+    }
+
+    it("should validate data", () => {
+      ajvs.forEach((ajv) => {
+        assert.strictEqual(ajv.validate(schema, {foo: "x", a: "a"}), true)
+        assert.strictEqual(ajv.validate(schema, {foo: "y", b: "b"}), true)
+        assert.strictEqual(ajv.validate(schema, {foo: "z", b: "b"}), true)
+        assert.strictEqual(ajv.validate(schema, {foo: "bar"}), false) // not in mapping
+        assert.strictEqual(ajv.validate(schema, {foo: "x", b: "b"}), false) // wrong subschema
+        assert.strictEqual(ajv.validate(schema, {foo: "y", a: "a"}), false) // wrong subschema
+      })
+    })
+  })
+
+  describe("valid schemas - mapping", () => {
+    it("mapping entry must correspond to a oneOf $ref", () => {
+      invalidSchema(
+        {
+          type: "object",
+          discriminator: {
+            propertyName: "foo",
+            mapping: {x: "#/definitions/nonexistent"},
+          },
+          required: ["foo"],
+          oneOf: [
+            {
+              $ref: "#/definitions/schema1",
+            },
+          ],
+          definitions: {
+            schema1: {properties: {foo: {type: "string"}}, required: ["foo"]},
+          },
+        },
+        /discriminator: mapping "x" does not correspond to any oneOf entry/
+      )
+    })
+
+    it("tag should be required when using mapping", () => {
+      invalidSchema(
+        {
+          type: "object",
+          discriminator: {
+            propertyName: "foo",
+            mapping: {x: "#/definitions/schema1"},
+          },
+          oneOf: [
+            {
+              $ref: "#/definitions/schema1",
+            },
+          ],
+          definitions: {
+            schema1: {properties: {foo: {type: "string"}}},
+          },
+        },
+        /discriminator: "foo" must be required/
+      )
     })
   })
 
